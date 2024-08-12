@@ -1,9 +1,10 @@
-import os
-
+ import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.cm import get_cmap
 import seaborn as sns
+import networkx as nx
 from DynaBench.handling import tables_errors
 import json
 
@@ -42,16 +43,21 @@ class Plotter:
         self._ene_thr = None
         self._ene_intf = None
         self._ene_path = None
+        self._nodes = False
+        self._nodes_path = None
+        self._freq = False
+        self._freq_path = None
 
         sns.set_style('whitegrid')
 
         if job_name is None:
-            for file in os.listdir(os.getcwd()):
-                if 'db' in file:
-                    self.job_path = os.path.join(os.getcwd(), file)
+            job_name = input('Plase provide job name, or existing job file where analysis folder is located:\n')
+            self.job_path = job_name
+
         else:
             self.job_path = os.path.join(os.getcwd(), job_name)
 
+        self.job_path
         self.target_path = os.path.join(self.job_path, "figures")
         self.table_path = os.path.join(self.job_path, "tables")
         if not os.path.exists(self.target_path):
@@ -137,15 +143,13 @@ class Plotter:
         Return: None
         """
 
-        #self.handler.test_intf_path(os.path.join(self.table_path, "interface_label_perc.csv"))
-
         if rmsf_path:
             self.handler.test_inp_path(rmsf_path)
             df1 = pd.read_csv(rmsf_path)
 
         if intf_path:
             self.handler.test_inp_path(intf_path)
-            df1 = pd.read_csv(intf_path)
+            df = pd.read_csv(intf_path)
 
         else:
             df1 = pd.read_csv(os.path.join(self.table_path, "QualityControl-overres.csv"))
@@ -161,28 +165,116 @@ class Plotter:
 
         if intf:
 
-            int_df = df[(df["Interface Label"] == 4) | (df["Interface Label"] == 2) | (df["Interface Label"] == 3) & (
-                    df["Percentage"] >= 50)]
+            int_df = df[(df["Interface Label"] == 4) | (df["Interface Label"] == 2) | (df["Interface Label"] == 3)]
+
+            int_df = int_df[int_df["Percentage"] >= 50]
             
             g2 = int_df.groupby(["Chain"])
 
+        max_y = np.max(df1['RMSF'])
+
         groups = df1.groupby(["Molecule"])
         
+        fig, axes = plt.subplots(1, len(groups), figsize=(10, 6), sharey=True)
+        
+        def get_jumpseq(data):
+            sequence = list()
+            for index,row in data.iterrows():
+                resnum = row['Residue Number']
+                if resnum == 0:
+                     resnum = 1
 
-        fig, axes = plt.subplots(1, len(groups), sharex="all", figsize=(10, 6), sharey=True)
+                while len(sequence) < resnum - 1:
+                    sequence.append('.')
+                sequence.append(resnum)
+            return sequence
+        
+        def get_jumped_markers(data, seq_list, jumped_data):
+            markers = list() #interface data alıyor
+            for x in data['Residue']:
+                res_num = int(x[3:])
+                try:
+                    ix = jumped_data[jumped_data['Residue Number'] == res_num].index[0]
+                except: continue
+                markers.append(ix)
+
+            return markers
+
+
         for ind, (ax, x) in enumerate(zip(axes, np.unique(df1["Molecule"]))):
             data = groups.get_group(x)
-            if intf:
-                int_data = g2.get_group(x)
-                markers = [int(x[3:]) for x in int_data["Residue"]]
-                ax.plot(data["Residue Number"], data["RMSF"], '-o', markevery=markers, markersize=3.5,
-                        color=self.chain_colors[ind])
-                ax.plot(data["Residue Number"], data["RMSF"], 'o', markevery=markers,
-                        label='Interface Residues', markersize=3.5, color="red")
-            else:
-                ax.plot(data["Residue Number"], data["RMSF"],
-                        color=self.chain_colors[ind])
+            if data.iloc[0]['Residue Number'] != 1 or data.iloc[-1]['Residue Number'] != len(data): #check the jump
+                sequence = get_jumpseq(data)
 
+                ax.set_xlim([1,len(sequence)])
+
+                jumped_data = pd.DataFrame(columns=['Molecule', 'Residue Number', 'RMSF'])
+                colss = []
+                idxs = []
+
+                overall_list = []
+
+                for idx,res in enumerate(sequence):
+                    if res != ".":
+
+                        if len(idxs) > 1:
+                            colss.append(idxs)
+                            idxs = []
+
+                        jumped_data.loc[len(jumped_data)] = data[data['Residue Number']== res].values[0]
+                        complete_end=False
+                        part_end = False
+
+                        try:
+                            if sequence[idx+1] == '.':
+                                part_end = True
+                        except IndexError:
+                            complete_end=True
+
+                        if complete_end or part_end:
+                            if intf:
+                                int_data = g2.get_group(x)
+                                markers = get_jumped_markers(int_data, sequence, jumped_data)
+                                overall_list.append([jumped_data, markers])
+
+                            else:
+                                overall_list.append([jumped_data])
+
+                            jumped_data = pd.DataFrame(columns=['Molecule', 'Residue Number', 'RMSF']) 
+
+                    else:
+                        idxs.append(idx + 1)
+
+                for el in overall_list:
+                    if len(el) > 1:
+                        ax.plot(el[0]["Residue Number"], el[0]["RMSF"], '-o', markevery=el[1], markersize=3.5,
+                            color=self.chain_colors[ind], linewidth=3)
+                        ax.plot(el[0]["Residue Number"], el[0]["RMSF"], 'o', markevery=el[1],
+                            label='Interface Residues', markersize=3.5, color="red", linewidth=3)
+                    else:
+                        data = el[0]
+                        ax.plot(data["Residue Number"], data["RMSF"],
+                                color=self.chain_colors[ind], linewidth=3)
+
+                for c in colss:
+                    ax.axvspan(np.min(c), np.max(c), facecolor="black", hatch="///", edgecolor="white", linewidth=0.0, alpha=0.45)
+
+
+            else:
+                if intf: #if no jmp, markers, intf yes
+                    int_data = g2.get_group(x)
+                    markers = [int(x[3:]) -1 for x in int_data["Residue"]]
+                    
+
+                    ax.plot(data["Residue Number"], data["RMSF"], '-o', markevery=markers, markersize=3.5,
+                            color=self.chain_colors[ind])
+                    ax.plot(data["Residue Number"], data["RMSF"], 'o', markevery=markers,
+                            label='Interface Residues', markersize=3.5, color="red")  #jump yok intf var
+                    
+                else:
+                    ax.plot(data["Residue Number"], data["RMSF"],
+                            color=self.chain_colors[ind]) #jump yok intf yok
+                
             ax.set_xlabel("Residue Number")
             ax.set_ylabel(f'RMSF (Å)')
             ax.set_title(f"Chain {x}", fontsize=16)
@@ -192,6 +284,7 @@ class Plotter:
         if intf:
             plt.legend()
         fig.savefig(os.path.join(self.target_path, f'RMSF-proteinCA.png'), dpi=300)
+
 
     def plot_biophys(self, path=None):
         """A function to perform barplot core-rim and biophysical classification visualization. Reads 'inetrface_label.csv' file.
@@ -238,9 +331,9 @@ class Plotter:
             elif r["Interface Label"] == 4:
                 ty.append("Core")
             elif r["Interface Label"] == 1:
-                ty.append("Interior")
-            elif r["Interface Label"] == 0:
                 ty.append("Surface")
+            elif r["Interface Label"] == 0:
+                ty.append("Interior")
 
         plot_df["Interface Text"] = ty
 
@@ -426,6 +519,34 @@ class Plotter:
         plt.title("Interface Residue Based Energy Evulation for Complete Simulation")
         plt.savefig(os.path.join(self.target_path, "interface_energy_eval.png"), dpi=300)
 
+
+################################################################################################################################################
+# Betweennesss frequency graph
+
+    def plot_freq(self, path=None):
+        """A function to perform bar plot Betweennesss frequency. 'Reads top_betweenness_node_frequencies.csv' file.
+
+        Return: None
+        """
+
+
+        if path:
+            self.handler.test_inp_path(path)
+            df = pd.read_csv(path)
+        else:
+            df = pd.read_csv(os.path.join(self.table_path, "top_betweenness_node_frequencies.csv"))
+        self._freq = True
+        self._freq_path = path
+
+        ### Bar plot for betweenness frequency.
+        fig, ax = plt.subplots(figsize = (10,6))
+        ax.plot([df["Node", df["Frequency"], color="blue")
+        ax.set_xlabel("Node")
+        ax.set_ylabel("Frequency")
+        ax.set_title("Betweenness Centrality Frequency Analysis")
+        fig.savefig(os.path.join(self.target_path, "Betweenness_Frequency_Analysis.png"), dpi= 300)
+
+#################################################################################################################################################################
     def _get_params_(self):
         params = {
             'job_name':self._job_name,
@@ -462,8 +583,14 @@ class Plotter:
                 'interface_table_path': self._ene_intf,
                 'residue_based_table': self._ene_path
                 },
+            'PlotBetFreq': {
+                'Run': self._freq,
+                'freq_table_path': self._freq_table_path,
+                },
 
             }
         json_path = os.path.join(self.job_path, 'plot_params.json')
         with open(json_path, 'w+') as ofh:
             json.dump(params, ofh)
+
+

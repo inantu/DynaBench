@@ -20,7 +20,7 @@ freesasa.setVerbosity(freesasa.silent)
 handler = hp.tables_errors()
 
 class dynabench:
-    def __init__(self, inp_file, stride=1, split_models=False, chains=None, job_name=None, dcd_pdb=None, show_time_as="Frame", timestep=None, time_unit=None):
+    def __init__(self, inp_file, stride=1, split_models=False, chains=None, job_name=None, dcd_pdb=None, show_time_as="Frame", timestep=None, time_unit=None, remove_water=True, remove_ions=True):
         """A class to perform Quality Control, Residue Based and Interaction Based analyses on MD simulations. Results of the analyses are printed as .csv files under a folder named 'tables'. MD outputs with any exception are transformed to .pdb file and the analyses are run through this .pdb file. Number of frames that will be fetched from initial input file to be analysed can be set by stride value.
         
         Keyword arguments:
@@ -47,11 +47,15 @@ class dynabench:
         self.qc_flag = False
         self.rb_flag = False
         self.ib_flag = False
+        self.tb_flag = False
         self.dcd_pdb = dcd_pdb
         self.stride = stride
         self.rmsd_data= None
+        self.contact_matrix_data = None
         self.get_all_hph = None
         self.foldx_path = None
+        self.remove_water = remove_water
+        self.remove_ions = remove_ions
 
         if job_name is None:
             file_name = inp_file.split('.')[0]
@@ -80,7 +84,12 @@ class dynabench:
             if not self.dcd_pdb:
                 self.dcd_pdb = input('Please provide input pdb file:\n')
 
-            self.pdb_file = os.path.join(self.job_path, self._preprocess_dcd(self.dcd_pdb, out_file, stride, inp_file))
+            remove_chains=[]
+            if remove_water:
+                remove_chains.append('V')
+            if remove_ions:
+                remove_chains.append('S')
+            self.pdb_file = os.path.join(self.job_path, self._preprocess_dcd(self.dcd_pdb, out_file, stride, inp_file, chains=remove_chains))
 
         elif file_ext == 'pdb':
             if self.stride != 1:
@@ -131,6 +140,8 @@ class dynabench:
             'show_time_as': self.time_Type,
             'timestep': self.timestep,
             'timeunit': self.time_unit,
+            'remove_water': self.remove_water,
+            'remove_ions': self.remove_ions,
 
             'QualityControl': {
                 'Run': self.qc_flag,
@@ -144,6 +155,9 @@ class dynabench:
                 'Run': self.ib_flag,
                 'get_all_hph': self.get_all_hph
             }
+            'TopologyBased': {
+                'Run': self.tb_flag,  ### change this
+                'contact_matrix_data':self.contact_matrix_data
 
         }
 
@@ -169,7 +183,7 @@ class dynabench:
         os.chdir(job_path)
 
     @staticmethod
-    def _preprocess_dcd(inp_pdb, output_file, stride, ab_file):
+    def _preprocess_dcd(inp_pdb, output_file, stride, ab_file, chains=list):
         """ Transforms input trajectory file into the .pdb file for given stride value.
         
         Keyword arguments:
@@ -185,7 +199,7 @@ class dynabench:
             for ts in u.trajectory[::stride]:
                 W.write(u.atoms)
 
-        ptm.chains(output_file, ['V', 'S'])
+        ptm.main2(output_file, chains)
         #os.system(f'python pdb_tool_modified.py -V,S {output_file} > {name}_chained.pdb')
 
         return name + "_chained.pdb"
@@ -228,8 +242,112 @@ class dynabench:
         self.get_all_hph=get_all_hph
         c = self.InteractionBased(self.pdb_file, self.target_path, get_all_hph=get_all_hph, timestep=self.timestep, timeunit=self.time_unit, time_type=self.time_Type, stride=self.stride)
         c.int_based_tbl()
+############################################################################################################
+#######################                    CONTACT MATRIX              ######################################
+class TopologyBasedAnalysis:
+    def __init__(self, pdb_path, dcd_path, stride, cutoff=4.5, no_contact=15000):
+        self.pdb_path = pdb_path
+        self.dcd_path = dcd_path
+        self.stride = stride
+        self.cutoff = cutoff
+        self.no_contact = no_contact
+        self.u = mda.Universe(pdb_path, dcd_path, all_coordinates=False, continuous=False)
+        print(f"MDAnalysis Universe created with PDB: {pdb_path} and DCD: {dcd_path}")
 
-    
+    def calculate_contact_matrix(self, output_path):
+        for ts in self.u.trajectory[::self.stride]:
+            print(f"Processing frame: {ts.frame}")
+            residue_coordinatesX, residue_coordinatesY, residue_coordinatesZ, residue_atom_counts, residue_chainIDs = self._extract_residue_coordinates()
+
+            residueX_array, residueY_array, residueZ_array, residue_array = self._prepare_coordinate_arrays(
+                residue_coordinatesX, residue_coordinatesY, residue_coordinatesZ, residue_atom_counts)
+
+            matrix_final = self._compute_contact_matrix(residueX_array, residueY_array, residueZ_array, residue_array, residue_chainIDs, residue_coordinatesX)
+
+            filtered_matrix = self._filter_contact_matrix(matrix_final)
+
+            output_files = os.path.join(output_path, f"matrix_final_{ts.frame}.out")
+            np.savetxt(output_files, filtered_matrix, fmt=['%s', '%d', '%s', '%d', '%.6f'], delimiter='\t')
+
+        return output_files
+
+    def _extract_residue_coordinates(self):
+        residue_coordinatesX = {}
+        residue_coordinatesY = {}
+        residue_coordinatesZ = {}
+        residue_atom_counts = {}
+        residue_chainIDs = {}
+
+        for residue in self.u.residues:
+            residue_number = (residue.segid, residue.resid)
+            chain_id = residue.segid
+            if residue_number not in residue_coordinatesX:
+                residue_coordinatesX[residue_number] = []
+                residue_coordinatesY[residue_number] = []
+                residue_coordinatesZ[residue_number] = []
+                residue_atom_counts[residue_number] = 0
+                residue_chainIDs[residue_number] = chain_id
+
+            for atom in residue.atoms:
+                residue_coordinatesX[residue_number].append(atom.position[0])
+                residue_coordinatesY[residue_number].append(atom.position[1])
+                residue_coordinatesZ[residue_number].append(atom.position[2])
+                residue_atom_counts[residue_number] += 1
+
+        return residue_coordinatesX, residue_coordinatesY, residue_coordinatesZ, residue_atom_counts, residue_chainIDs
+
+    def _prepare_coordinate_arrays(self, residue_coordinatesX, residue_coordinatesY, residue_coordinatesZ, residue_atom_counts):
+        max_atomsX = max(len(coords) for coords in residue_coordinatesX.values())
+        max_atomsY = max(len(coords) for coords in residue_coordinatesY.values())
+        max_atomsZ = max(len(coords) for coords in residue_coordinatesZ.values())
+
+        residueX_array = np.full((len(residue_coordinatesX), max_atomsX), np.nan)
+        residueY_array = np.full((len(residue_coordinatesY), max_atomsY), np.nan)
+        residueZ_array = np.full((len(residue_coordinatesZ), max_atomsZ), np.nan)
+
+        for i, coords in enumerate(residue_coordinatesX.values()):
+            residueX_array[i, :len(coords)] = coords
+        for i, coords in enumerate(residue_coordinatesY.values()):
+            residueY_array[i, :len(coords)] = coords
+        for i, coords in enumerate(residue_coordinatesZ.values()):
+            residueZ_array[i, :len(coords)] = coords
+
+        residue_array = np.array(list(residue_atom_counts.values()))
+
+        return residueX_array, residueY_array, residueZ_array, residue_array
+
+    def _compute_contact_matrix(self, residueX_array, residueY_array, residueZ_array, residue_array, residue_chainIDs, residue_coordinatesX):
+        total_residues = len(residue_array)
+        matrix_final = np.zeros((self.no_contact, 5), dtype=object)
+
+        for i in range(total_residues):
+            for j in range(i + 1, total_residues):
+                contact = 0
+                for k in range(residue_array[i]):
+                    for l in range(residue_array[j]):
+                        dx = residueX_array[i, k] - residueX_array[j, l]
+                        dy = residueY_array[i, k] - residueY_array[j, l]
+                        dz = residueZ_array[i, k] - residueZ_array[j, l]
+                        r2 = dx * dx + dy * dy + dz * dz
+                        if i != j and r2 <= self.cutoff * self.cutoff:
+                            contact += 1
+
+                if contact != 0:
+                    weight = contact / (residue_array[i] ** 0.5) / (residue_array[j] ** 0.5))
+                    matrix_final[len(np.where(matrix_final[:, 4] != 0)[0])] = [
+                        residue_chainIDs[list(residue_coordinatesX.keys())[i]],
+                        list(residue_coordinatesX.keys())[i],
+                        residue_chainIDs[list(residue_coordinatesX.keys())[j]],
+                        list(residue_coordinatesX.keys())[j],
+                        weight
+                    ]
+
+        return matrix_final
+
+    def _filter_contact_matrix(self, matrix_final):
+        return np.array([row for row in matrix_final if row[1] != 0 and row[3] != 0 and row[4] != 0], dtype=object)
+###########################################################################################################################################################################################
+
     class QualityControl:
         def __init__(self, pdb_file, target_path, rmsd_data, timestep, time_unit, time_type, stride):
             """ A class to perform Quality Control analyses (RMSD, RG, and RMSF) of the trajectory. Initially runs private methods and defines RMSD, RG, and RMSF results of the trajectory.
@@ -438,10 +556,10 @@ class dynabench:
             """ Residues are classified according to the their rASA (relative accessible solvent area) values for both monomer (rASAm) and complex (rASAc) conformations by Levy et al. For more information about core-rim classification, please visit https://doi.org/10.1016/j.jmb.2010.09.028.
 
             This function classifies the residue according to the given rASA values. The classification labels are:
-                0=Surface, 1=Interior, 2=Support, 3=Rim, 4=Core
+                0=Interior, 1=Surface, 2=Support, 3=Rim, 4=Core
 
             Keyword arguments:
-            delta_ras -- rASAc - rASAm
+            delta_ras -- rASAm - rASAc
             rasc -- rASA value for complex conformation
             rasm -- rASA value for monomer conformation
             Return: int: Interface Class label.
@@ -520,6 +638,31 @@ class dynabench:
 
                     self.hbond = self.bb_hbond + self.sc_hbond
 
+            def _replace_nonstandards_foldx(file_path, models_path):
+                with open(file_path, 'r') as file:
+                    content = file.read()
+                f_name = file_path.split(".pdb")[0]
+                if "HID" in content:
+                    os.system(f"pdb_rplresname -HID:H2S {file_path} >{f_name}_rpl_1.pdb")
+                    os.system(f"pdb_rplresname -HIE:H1S {f_name}_rpl_1.pdb >{f_name}_rpl.pdb")
+
+                elif "HSD" in content:
+                    os.system(f"pdb_rplresname -HSD:H2S {file_path} >{f_name}_rpl_1.pdb")
+                    os.system(f"pdb_rplresname -HSE:H1S {f_name}_rpl_1.pdb >{f_name}_rpl.pdb")
+
+                elif "HISA" in content:
+                    os.system(f"pdb_rplresname -HISA:H2S {file_path} >{f_name}_rpl_1.pdb")
+                    os.system(f"pdb_rplresname -HISB:H1S {f_name}_rpl_1.pdb >{f_name}_rpl.pdb")
+
+                elif "HISD" in content:
+                    os.system(f"pdb_rplresname -HISD:H2S {file_path} >{f_name}_rpl_1.pdb")
+                    os.system(f"pdb_rplresname -HISE:H1S {f_name}_rpl_1.pdb >{f_name}_rpl.pdb")
+
+                if os.path.exists(os.path.join(models_path, f"{f_name}_rpl_1.pdb")):
+                    os.remove(f"{f_name}_rpl_1.pdb")
+
+                    os.remove(file_path)
+
             result = dict()
 
             #run foldx
@@ -546,20 +689,27 @@ class dynabench:
             
             os.system(f"pdb_splitmodel {inp_path}")
 
+            for file in os.listdir(models_path):
+
+                _replace_nonstandards_foldx(file, models_path)
+
             os.chdir(current)
 
             with open(os.path.join(job_path, 'pdb_list.out'), 'w+') as fh:
                 for file in os.listdir(models_path):
                     fh.write(f"{file}\n")
 
-            subprocess.run(f"{foldx_exe_path} --command=SequenceDetail --output-dir={output_path} --pdb-dir={models_path} --pdb-list={os.path.join(job_path,'pdb_list.out')}", stdout=subprocess.DEVNULL)
+            subprocess.run([f"{foldx_exe_path}", '--command=SequenceDetail', f'--output-dir={output_path}', f'--pdb-dir={models_path}', f"--pdb-list={os.path.join(job_path,'pdb_list.out')}"], stdout=subprocess.DEVNULL)
 
             os.remove(os.path.join(job_path, 'pdb_list.out'))
 
             #read outputs
 
             for file in os.listdir(output_path):
-                frame = int(file.split('.')[0].split('_')[-1]) - 1
+                try:
+                    frame = int(file.split('.')[0].split('_')[-2]) - 1
+                except ValueError: 
+                    frame = int(file.split('.')[0].split('_')[-1]) - 1
                 if frame not in result.keys():
                     result[frame] = dict()
                 with open(os.path.join(output_path, file), 'r+') as fh:
@@ -694,12 +844,50 @@ class dynabench:
             self._struct = app.PDBFile(pdb_path)
             self.target_path = target_path
 
+        def _replace_nonstandards(self, ):
+            with open(self.pdb_path, 'r') as file:
+                content = file.read()
+            f_name = self.pdb_path.split(".pdb")[0]
+            if "HID" in content:
+                os.system(f"pdb_rplresname -HID:HIS {self.pdb_path} >{f_name}_rpl_1.pdb")
+                os.system(f"pdb_rplresname -HIE:HIS {f_name}_rpl_1.pdb >{f_name}_rpl.pdb")
+                os.remove(f"{f_name}_rpl_1.pdb")
+                
+
+            elif "HSD" in content:
+                os.system(f"pdb_rplresname -HSD:HIS {self.pdb_path} >{f_name}_rpl_1.pdb")
+                os.system(f"pdb_rplresname -HSE:HIS {f_name}_rpl_1.pdb >{f_name}_rpl_2.pdb")
+                os.system(f"pdb_rplresname -HSP:HIP {f_name}_rpl_2.pdb >{f_name}_rpl.pdb")
+                os.remove(f"{f_name}_rpl_1.pdb")
+                os.remove(f"{f_name}_rpl_2.pdb")
+
+            elif "HISA" in content:
+                os.system(f"pdb_rplresname -HISA:HIS {self.pdb_path} >{f_name}_rpl_1.pdb")
+                os.system(f"pdb_rplresname -HISB:HIS {f_name}_rpl_1.pdb >{f_name}_rpl_2.pdb")
+                os.system(f"pdb_rplresname -HISH:HIP {f_name}_rpl_2.pdb >{f_name}_rpl.pdb")
+                os.remove(f"{f_name}_rpl_1.pdb")
+                os.remove(f"{f_name}_rpl_2.pdb")
+
+
+            elif "HISD" in content:
+                os.system(f"pdb_rplresname -HISD:HIS {self.pdb_path} >{f_name}_rpl_1.pdb")
+                os.system(f"pdb_rplresname -HISE:HIS {f_name}_rpl_1.pdb >{f_name}_rpl_2.pdb")
+                os.system(f"pdb_rplresname -HISP:HIP {f_name}_rpl_2.pdb >{f_name}_rpl.pdb")
+                os.remove(f"{f_name}_rpl_1.pdb")
+                os.remove(f"{f_name}_rpl_2.pdb")
+
+            
+            self.pdb_path= f"{f_name}_rpl.pdb"
+
+
         def _calc_interactions(self):
             """Calculates the interactions by Interfacea package.
             
             Return: list: A list of lists such as [interaction_table, frame_number].
             """
             
+            self._replace_nonstandards()
+
             return_list = []
             for i in range(0, len(self._struct._positions)):
                 self._struct.positions = self._struct._positions[i]
